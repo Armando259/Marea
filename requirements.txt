@@ -1,0 +1,9 @@
+pandas
+numpy
+scikit-learn
+joblib
+requests
+fastapi
+uvicorn
+apscheduler
+catboost

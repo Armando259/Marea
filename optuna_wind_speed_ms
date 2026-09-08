@@ -1,0 +1,178 @@
+import os
+import glob
+import json
+import joblib
+import pandas as pd
+from lightgbm import LGBMRegressor
+from xgboost import XGBRegressor
+
+# -----------------------------
+# Postavke
+# -----------------------------
+
+OPTUNA_CSV = "optuna_vjetar_svi_horizonti.csv"
+DATA_CSV = "ERA5_SPOJENO_2015_2023.csv"
+MODELS_DIR = "models2"          # isti folder kao ostali modeli
+TARGET_NAME = "wind_speed_ms"    # koristi se u imenima fajlova
+
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+# -----------------------------
+# 0) Obriši stare modele za smjer vjetra
+# -----------------------------
+
+# Prilagodi ovaj pattern točnom imenu targeta koji brišeš
+# (npr. ako su fajlovi "LightGBM_wind_dir_deg_1h.joblib" itd.)
+OLD_TARGET_PATTERN = "wind_dir"  # dio imena fajla koji identificira stare modele
+
+deleted = 0
+for f in glob.glob(os.path.join(MODELS_DIR, f"*{OLD_TARGET_PATTERN}*")):
+    os.remove(f)
+    deleted += 1
+    print(f"Obrisano: {f}")
+
+print(f"Ukupno obrisano starih fajlova: {deleted}")
+
+
+# -----------------------------
+# 1) Učitavanje i priprema df-a
+# -----------------------------
+
+def load_main_dataframe():
+    df = pd.read_csv(DATA_CSV)
+    if "valid_time" in df.columns:
+        df["valid_time"] = pd.to_datetime(df["valid_time"])
+        df = df.sort_values("valid_time")
+    return df
+
+
+def add_wind_targets(df):
+    horizons = [1, 3, 6, 9, 12]
+
+    if "wind_speed_ms" not in df.columns:
+        raise ValueError("Kolona 'wind_speed_ms' ne postoji u df! Provjeri DATA_CSV.")
+
+    for h in horizons:
+        col_name = f"wind_speed_ms_future_{h}h"
+        df[col_name] = df["wind_speed_ms"].shift(-h)
+
+    target_cols = [f"wind_speed_ms_future_{h}h" for h in horizons]
+    df = df.dropna(subset=target_cols)
+    return df
+
+
+def get_train_data_for_horizon(df, horizon_hours):
+    target_col = f"wind_speed_ms_future_{horizon_hours}h"
+
+    all_future_cols = [c for c in df.columns if c.startswith("wind_speed_ms_future_")]
+
+    if target_col not in df.columns:
+        raise ValueError(f"Target kolona '{target_col}' ne postoji u df.columns!")
+
+    feature_cols = [
+        c for c in df.columns
+        if c not in all_future_cols
+        and c not in ["valid_time"]
+    ]
+
+    X = df[feature_cols]
+    y = df[target_col].values
+    return X, y, feature_cols
+
+
+# -----------------------------
+# 2) Učitavanje Optuna rezultata
+# -----------------------------
+
+optuna_df = pd.read_csv(OPTUNA_CSV)
+
+if "target" in optuna_df.columns:
+    optuna_df = optuna_df[optuna_df["target"] == "wind_speed_ms"]
+
+best_by_horizon = (
+    optuna_df.sort_values("best_MAE")
+             .groupby("horizon_hours", as_index=False)
+             .first()
+)
+
+print("Najbolji modeli po horizontu:")
+print(best_by_horizon[["horizon_hours", "model", "best_MAE"]])
+
+
+# -----------------------------
+# 3) Treniranje modela po horizontu (format: model.joblib + features.json + medians.json)
+# -----------------------------
+
+df = load_main_dataframe()
+df = add_wind_targets(df)
+
+print(f"Broj redaka za treniranje: {len(df)}")
+
+for _, row in best_by_horizon.iterrows():
+    horizon = int(row["horizon_hours"])
+    model_name = row["model"]  # "LightGBM" ili "XGBoost"
+
+    print(f"\n=== Treniranje za horizont {horizon}h ({model_name}) ===")
+
+    X_train, y_train, feature_cols = get_train_data_for_horizon(df, horizon)
+    print(f"X_train shape: {X_train.shape}")
+
+    # Medijani feature-a - za imputaciju na inferenciji (fillna kad neki feature nedostaje)
+    medians = X_train.median(numeric_only=True).to_dict()
+
+    if model_name == "LightGBM":
+        params = {
+            "n_estimators": int(row["n_estimators"]),
+            "learning_rate": float(row["learning_rate"]),
+            "num_leaves": int(row["num_leaves"]),
+            "max_depth": int(row["max_depth"]),
+            "min_child_samples": int(row["min_child_samples"]),
+            "subsample": float(row["subsample"]),
+            "colsample_bytree": float(row["colsample_bytree"]),
+            "reg_alpha": float(row["reg_alpha"]),
+            "reg_lambda": float(row["reg_lambda"]),
+        }
+        model = LGBMRegressor(objective="regression", n_jobs=-1, verbosity=-1, **params)
+
+    else:  # XGBoost
+        params = {
+            "n_estimators": int(row["n_estimators"]),
+            "learning_rate": float(row["learning_rate"]),
+            "min_child_weight": float(row["min_child_weight"]),
+            "subsample": float(row["subsample"]),
+            "colsample_bytree": float(row["colsample_bytree"]),
+            "reg_alpha": float(row["reg_alpha"]),
+            "reg_lambda": float(row["reg_lambda"]),
+            "gamma": float(row["gamma"]),
+        }
+        model = XGBRegressor(
+            objective="reg:squarederror",
+            tree_method="hist",
+            n_jobs=-1,
+            verbosity=1,
+            **params
+        )
+
+    # Treniraj model (koristi X kao DataFrame da imena kolona ostanu poznata modelu)
+    model.fit(X_train.values, y_train)
+
+    # Imena fajlova prema konvenciji modela2: {Model}_{target}_{horizon}h.*
+    base_name = f"{model_name}_{TARGET_NAME}_{horizon}h"
+
+    model_path = os.path.join(MODELS_DIR, f"{base_name}.joblib")
+    features_path = os.path.join(MODELS_DIR, f"{base_name}_features.json")
+    medians_path = os.path.join(MODELS_DIR, f"{base_name}_medians.json")
+
+    joblib.dump(model, model_path)
+
+    with open(features_path, "w", encoding="utf-8") as f:
+        json.dump(feature_cols, f, ensure_ascii=False, indent=2)
+
+    with open(medians_path, "w", encoding="utf-8") as f:
+        json.dump(medians, f, ensure_ascii=False, indent=2)
+
+    print(f"Spremljeno: {model_path}")
+    print(f"Spremljeno: {features_path}")
+    print(f"Spremljeno: {medians_path}")
+
+print("\nSvi wind_speed_ms modeli su istrenirani i spremljeni u models2/.")

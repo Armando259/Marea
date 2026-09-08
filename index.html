@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="hr">
+<head>
+<meta charset="UTF-8">
+<title>Meteo prognoza — Pula / Rijeka</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1720;
+    --panel: #17212c;
+    --line: #2a3644;
+    --text: #e6edf3;
+    --muted: #8b98a5;
+    --accent: #5fb0ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: 24px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .controls { display: flex; gap: 8px; margin-bottom: 20px; }
+  button.loc {
+    background: var(--panel); border: 1px solid var(--line); color: var(--text);
+    padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 14px;
+  }
+  button.loc.active { border-color: var(--accent); color: var(--accent); }
+  #status { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+    gap: 16px;
+  }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 14px 16px;
+  }
+  .card h3 {
+    margin: 0 0 8px; font-size: 13px; color: var(--muted);
+    font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+  }
+  canvas { max-height: 180px; }
+
+  /* --- Strelice smjera --- */
+  .arrow-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    height: 160px;
+    padding: 8px 4px 0;
+    position: relative;
+    overflow-x: auto;
+  }
+  .arrow-col {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    flex: 1;
+    min-width: 48px;
+  }
+  .arrow-north-label {
+    font-size: 10px;
+    color: var(--muted);
+    text-align: center;
+    margin-bottom: 2px;
+  }
+  .arrow-svg-wrap {
+    width: 100%;
+    height: 60px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .arrow-svg {
+    transition: transform 0.2s ease;
+  }
+  .arrow-speed {
+    font-size: 12px;
+    color: var(--text);
+    font-weight: 600;
+  }
+  .arrow-time {
+    font-size: 10px;
+    color: var(--muted);
+  }
+</style>
+</head>
+<body>
+
+<h1>Marea predviđanje atmosferskih i morskih uvjeta — sljedećih 12h</h1>
+<div class="sub" id="baseTime">učitavanje...</div>
+
+<div class="controls">
+  <button class="loc active" data-loc="pula">Pula</button>
+  <button class="loc" data-loc="rijeka">Rijeka</button>
+</div>
+
+<div id="status"></div>
+<div class="grid" id="grid"></div>
+
+<script>
+const API = 'http://localhost:8000';
+
+const LABELS = {
+  t2m_c: 'Temperatura (°C)',
+  wind_speed_ms: 'Vjetar (m/s)',
+  wind_dir_deg: 'Vjetar — smjer (°)',
+  mwd: 'Valovi — smjer (°)',
+  swh: 'Valovi — visina (m)',
+  mwp: 'Valovi — period (s)',
+  sst_c: 'Temp. mora (°C)',
+  msl_hpa: 'Tlak (hPa)',
+  tcc: 'Oblačnost (0-1)',
+  cape: 'CAPE (J/kg)',
+  blh: 'Visina graničnog sloja (m)',
+};
+
+// Defaultni redoslijed, ako backend ne pošalje "order"
+const DEFAULT_ORDER = [
+  't2m_c',
+  'wind_speed_ms',
+  'wind_dir_deg',
+  'swh',
+  'mwp',
+  'mwd',
+  'sst_c',
+  'msl_hpa',
+  'tcc',
+  'cape',
+  'blh',
+];
+
+// Mapiranje: smjer -> koji target nosi magnitudu (brzinu/visinu) za tu strelicu
+const DIRECTION_PAIRS = {
+  wind_dir_deg: { magnitudeTarget: 'wind_speed_ms', label: 'Smjer vjetra', unit: 'm/s' },
+  mwd:          { magnitudeTarget: 'swh',           label: 'Smjer valova', unit: 'm' },
+};
+
+let currentLoc = 'pula';
+
+async function load(loc) {
+  document.getElementById('status').textContent = 'Dohvaćam prognozu...';
+  try {
+    const res = await fetch(`${API}/forecast/${loc}`);
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    const data = await res.json();
+    render(data);
+    document.getElementById('status').textContent = '';
+  } catch (e) {
+    document.getElementById('status').textContent = `Greška: ${e.message}`;
+  }
+}
+
+// SVG strelica: 0° = sjever gore. Ulazni deg je smjer ODAKLE vjetar/val dolazi.
+// Strelica se rotira tako da pokazuje KAMO puše/ide (deg + 180).
+function arrowSVG(directionFromDeg) {
+  const blowTo = (directionFromDeg + 180) % 360;
+  return `
+    <svg class="arrow-svg" width="40" height="40" viewBox="0 0 48 48"
+         style="transform: rotate(${blowTo}deg);">
+      <line x1="24" y1="40" x2="24" y2="8" stroke="#5fb0ff" stroke-width="3" stroke-linecap="round"/>
+      <polygon points="24,4 17,16 31,16" fill="#5fb0ff"/>
+    </svg>
+  `;
+}
+
+function renderArrowCard(target, points, magnitudePoints) {
+  const card = document.createElement('div');
+  card.className = 'card';
+
+  const pairInfo = DIRECTION_PAIRS[target];
+  const title = pairInfo ? pairInfo.label : (LABELS[target] || target);
+
+  const cols = points.map((p, i) => {
+    const dirDeg = p.value;
+    const mag = magnitudePoints ? magnitudePoints[i]?.value : null;
+    const time = p.time.slice(11, 16);
+    const magText = (mag !== null && mag !== undefined)
+      ? `${mag.toFixed(1)} ${pairInfo ? pairInfo.unit : ''}`
+      : '';
+
+    return `
+      <div class="arrow-col">
+        <div class="arrow-svg-wrap">${arrowSVG(dirDeg)}</div>
+        <div class="arrow-speed">${magText}</div>
+        <div class="arrow-time">${time}</div>
+      </div>
+    `;
+  }).join('');
+
+  card.innerHTML = `
+    <h3>${title}</h3>
+    <div class="arrow-north-label">↑ Sjever gore</div>
+    <div class="arrow-row">${cols}</div>
+  `;
+  return card;
+}
+
+function renderLineCard(target, points) {
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML = `<h3>${LABELS[target] || target}</h3><canvas></canvas>`;
+
+  const ctx = card.querySelector('canvas').getContext('2d');
+  new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: points.map(p => p.time.slice(11, 16)),
+      datasets: [{
+        data: points.map(p => p.value),
+        borderColor: '#5fb0ff',
+        backgroundColor: 'rgba(95,176,255,0.1)',
+        tension: 0.3,
+        fill: true,
+        pointRadius: 2,
+      }],
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { grid: { color: '#2a3644' }, ticks: { color: '#8b98a5' } },
+        y: { grid: { color: '#2a3644' }, ticks: { color: '#8b98a5' } },
+      },
+    },
+  });
+
+  return card;
+}
+
+function render(data) {
+  document.getElementById('baseTime').textContent =
+    `Zadnje osvježenje podataka: ${data.base_time}`;
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+
+  const series = data.series || {};
+  const order = (data.order && Array.isArray(data.order) && data.order.length)
+    ? data.order
+    : DEFAULT_ORDER;
+
+  // Kartice u redoslijedu koji je poslao backend (ili defaultnom)
+  order.forEach(target => {
+    const points = series[target];
+    if (!points || !points.length) return;
+
+    if (DIRECTION_PAIRS[target]) {
+      const magTarget = DIRECTION_PAIRS[target].magnitudeTarget;
+      const magPoints = series[magTarget] || null;
+      grid.appendChild(renderArrowCard(target, points, magPoints));
+    } else {
+      grid.appendChild(renderLineCard(target, points));
+    }
+  });
+}
+
+document.querySelectorAll('button.loc').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('button.loc').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentLoc = btn.dataset.loc;
+    load(currentLoc);
+  });
+});
+
+load(currentLoc);
+setInterval(() => load(currentLoc), 5 * 60 * 1000); // osvježi prikaz svakih 5 min
+</script>
+
+</body>
+</html>
